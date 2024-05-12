@@ -1,0 +1,121 @@
+permissions:
+  contents: read
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - plugins/**
+  workflow_dispatch:
+
+# If new code is pushed to a PR branch, then cancel in progress workflows for that PR.
+# Ensures that we don't waste CI time, and returns results quicker
+# https://github.com/jonhoo/rust-ci-conf/pull/5
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+name: Build and publish form plugin
+jobs:
+  required:
+    #Don't change noble without changing the Dockerfile
+    runs-on: ubuntu-22.04
+    name: ubuntu / ${{ matrix.toolchain }}
+    strategy:
+      matrix:
+        # run on stable and beta to ensure that tests won't break on the next version of the rust
+        # toolchain
+        #, beta
+        toolchain: [ stable ]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v2
+        with:
+          version: "25.x"
+
+      - name: Install ${{ matrix.toolchain }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+
+      - name: cargo generate-lockfile
+        # enable this ci template to run regardless of whether the lockfile is checked in or not
+        if: hashFiles('Cargo.lock') == ''
+        run: cargo generate-lockfile
+
+      #Build before starting K8s cluster - no pointing starting if build will fail
+      - name: cargo build
+        run: cargo build
+
+      # https://twitter.com/jonhoo/status/1571290371124260865
+      - name: cargo test --locked
+        run: cargo test --locked --all-features --all-targets
+
+      # https://github.com/rust-lang/cargo/issues/6669
+      - name: cargo test --doc
+        run: cargo test --locked --all-features --doc
+
+#      - name: build RAPID plugin
+#        run: cargo build --release --package server
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v1
+
+      - name: Login to DockerHub
+        uses: docker/login-action@v1
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Setup params
+        id: params
+        run: |
+          branch=`git rev-parse --abbrev-ref HEAD`
+          branch=`echo $branch|sed 's#/#-#g'` #replace / in branch names with -
+          today=`date '+%Y-%m-%d'`
+          commit=`git rev-parse --short HEAD`
+          tag="${branch}-${today}-$commit"
+          pluginTag="hypi/my-plugin:$tag"
+          latestPluginTag="hypi/my-plugin:latest"
+          echo "tag=$(echo ${tag})" >> $GITHUB_ENV
+          echo ::set-output name=pluginTags::${pluginTag}
+          echo ::set-output name=latestPluginTags::${latestPluginTag}
+          echo ::set-output name=tag::${tag}
+          echo $pluginTag
+
+      - name: Build and push
+        id: docker_build_plugin_form
+        uses: docker/build-push-action@v2
+        with:
+          context: plugins/form
+          file: plugins/form/Dockerfile
+          push: true
+          build-args: |
+            CI_USER=${{ secrets.CI_USER }}
+            CI_PASS=${{ secrets.CI_PASS }}
+          tags: ${{ steps.params.outputs.pluginTags }}
+
+      - name: Build and push - latest
+        id: docker_build_plugin_form_latest
+        uses: docker/build-push-action@v2
+        with:
+          context: plugins/form
+          file: plugins/form/Dockerfile
+          push: true
+          build-args: |
+            CI_USER=${{ secrets.CI_USER }}
+            CI_PASS=${{ secrets.CI_PASS }}
+          tags: ${{ steps.params.outputs.latestPluginTags }}
+
+      - name: Tag and push
+        run: |
+          git config --global user.email "github-action@hypi.io"
+          git config --global user.name "Hypi Github Action"
+          git tag ${{ env.tag }} && \
+          git pull origin $(git rev-parse --abbrev-ref HEAD) && \
+          git push origin $(git rev-parse --abbrev-ref HEAD) && \
+          git push origin --tags
